@@ -17,3 +17,4 @@
 from .config import RobotConfig
 from .robot import Robot
 from .utils import make_robot_from_config
+from .tron2 import Tron2Robot, Tron2RobotConfig
