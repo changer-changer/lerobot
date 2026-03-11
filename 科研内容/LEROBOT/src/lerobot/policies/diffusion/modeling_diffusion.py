@@ -140,12 +140,34 @@ class DiffusionPolicy(PreTrainedPolicy):
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
+        if self.training:
+            if not hasattr(self, "global_step_tensor"):
+                self.register_buffer("global_step_tensor", torch.tensor(0, dtype=torch.long))
+            self.global_step_tensor += 1
+
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             for key in self.config.image_features:
                 if self.config.n_obs_steps == 1 and batch[key].ndim == 4:
                     batch[key] = batch[key].unsqueeze(1)
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+            
+            # FACTR image blurring curriculum
+            if self.training and getattr(self.config, "use_factr", False) and hasattr(self, "global_step_tensor"):
+                step = self.global_step_tensor.item()
+                decay_steps = getattr(self.config, "factr_decay_steps", 100000)
+                progress = min(1.0, step / max(1, decay_steps))
+                current_sigma = getattr(self.config, "factr_blur_sigma_initial", 5.0) * (1 - progress)
+                
+                if current_sigma > 0.1:
+                    import torchvision.transforms.functional as TF
+                    b_imgs = einops.rearrange(batch[OBS_IMAGES], "b s n c h w -> (b s n) c h w")
+                    kernel_size = max(3, int(current_sigma * 3))
+                    if kernel_size % 2 == 0:
+                        kernel_size += 1
+                    b_imgs = TF.gaussian_blur(b_imgs, kernel_size=[kernel_size, kernel_size], sigma=[current_sigma, current_sigma])
+                    batch[OBS_IMAGES] = einops.rearrange(b_imgs, "(b s n) c h w -> b s n c h w", b=batch[OBS_IMAGES].shape[0], s=batch[OBS_IMAGES].shape[1])
+
         loss = self.diffusion.compute_loss(batch)
         # no output_dict so returning None
         return loss, None
@@ -162,6 +184,31 @@ def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMSche
         return DDIMScheduler(**kwargs)
     else:
         raise ValueError(f"Unsupported noise scheduler type {name}")
+
+
+class PointNetEncoder(nn.Module):
+    """Encodes a 3D tactile point cloud (B, num_points, data_dim) into a 1D feature vector."""
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.conv1 = nn.Conv1d(in_channels, 64, 1)
+        self.conv2 = nn.Conv1d(64, 128, 1)
+        self.conv3 = nn.Conv1d(128, out_channels, 1)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.bn3 = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU()
+        self.out_channels = out_channels
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x shape: (B, num_points, in_channels)
+        x = x.transpose(1, 2)  # (B, in_channels, num_points)
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        x = self.bn3(self.conv3(x))
+        # Max pool over the points
+        x = torch.max(x, 2, keepdim=True)[0]
+        x = x.view(-1, x.shape[1])
+        return x
 
 
 class DiffusionModel(nn.Module):
@@ -182,6 +229,14 @@ class DiffusionModel(nn.Module):
                 global_cond_dim += self.rgb_encoder.feature_dim * num_images
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
+
+        if getattr(self.config, "tactile_features", None):
+            tactile_shape = next(iter(self.config.tactile_features.values())).shape
+            self.tactile_encoder = PointNetEncoder(
+                in_channels=tactile_shape[-1], 
+                out_channels=getattr(self.config, "pointnet_hidden_dim", 256)
+            )
+            global_cond_dim += self.tactile_encoder.out_channels * len(self.config.tactile_features)
 
         self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
 
@@ -277,6 +332,15 @@ class DiffusionModel(nn.Module):
 
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV_STATE])
+
+        if getattr(self.config, "tactile_features", None):
+            for key in self.config.tactile_features:
+                if key in batch:
+                    # batch[key] shape: (B, n_obs_steps, num_points, 6)
+                    tactile_data = einops.rearrange(batch[key], "b s n d -> (b s) n d")
+                    encoded = self.tactile_encoder(tactile_data)
+                    encoded = einops.rearrange(encoded, "(b s) d -> b s d", b=batch_size, s=n_obs_steps)
+                    global_cond_feats.append(encoded)
 
         # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
@@ -454,18 +518,12 @@ class DiffusionRgbEncoder(nn.Module):
     def __init__(self, config: DiffusionConfig):
         super().__init__()
         # Set up optional preprocessing.
-        if config.resize_shape is not None:
-            self.resize = torchvision.transforms.Resize(config.resize_shape)
-        else:
-            self.resize = None
-
-        crop_shape = config.crop_shape
-        if crop_shape is not None:
+        if config.crop_shape is not None:
             self.do_crop = True
             # Always use center crop for eval
-            self.center_crop = torchvision.transforms.CenterCrop(crop_shape)
+            self.center_crop = torchvision.transforms.CenterCrop(config.crop_shape)
             if config.crop_is_random:
-                self.maybe_random_crop = torchvision.transforms.RandomCrop(crop_shape)
+                self.maybe_random_crop = torchvision.transforms.RandomCrop(config.crop_shape)
             else:
                 self.maybe_random_crop = self.center_crop
         else:
@@ -491,16 +549,13 @@ class DiffusionRgbEncoder(nn.Module):
 
         # Set up pooling and final layers.
         # Use a dry run to get the feature map shape.
-        # The dummy shape mirrors the runtime preprocessing order: resize -> crop.
+        # The dummy input should take the number of image channels from `config.image_features` and it should
+        # use the height and width from `config.crop_shape` if it is provided, otherwise it should use the
+        # height and width from `config.image_features`.
 
         # Note: we have a check in the config class to make sure all images have the same shape.
         images_shape = next(iter(config.image_features.values())).shape
-        if config.crop_shape is not None:
-            dummy_shape_h_w = config.crop_shape
-        elif config.resize_shape is not None:
-            dummy_shape_h_w = config.resize_shape
-        else:
-            dummy_shape_h_w = images_shape[1:]
+        dummy_shape_h_w = config.crop_shape if config.crop_shape is not None else images_shape[1:]
         dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
@@ -516,10 +571,7 @@ class DiffusionRgbEncoder(nn.Module):
         Returns:
             (B, D) image feature.
         """
-        # Preprocess: resize if configured, then crop if configured.
-
-        if self.resize is not None:
-            x = self.resize(x)
+        # Preprocess: maybe crop (if it was set up in the __init__).
         if self.do_crop:
             if self.training:  # noqa: SIM108
                 x = self.maybe_random_crop(x)
